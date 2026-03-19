@@ -1,0 +1,213 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+
+RISK_FREE_RATE = 0.0
+IQR_MULTIPLIER = 4.5
+
+
+def remove_spikes(df, multiplier=IQR_MULTIPLIER):
+    q1  = df["LogReturn"].quantile(0.25)
+    q3  = df["LogReturn"].quantile(0.75)
+    iqr = q3 - q1
+    lower = q1 - multiplier * iqr
+    upper = q3 + multiplier * iqr
+    removed = ((df["LogReturn"] < lower) | (df["LogReturn"] > upper)).sum()
+    print(f"[INFO] Spike filter removed {removed} row(s) "
+          f"(IQR x {multiplier} fence: [{lower:.4f}, {upper:.4f}])")
+    mask = (df["LogReturn"] >= lower) & (df["LogReturn"] <= upper)
+    return df[mask].reset_index(drop=True)
+
+
+def find_intersections(dates, y1, y2):
+    diff       = np.array(y1) - np.array(y2)
+    intersects = []
+    for i in range(len(diff) - 1):
+        d0, d1 = diff[i], diff[i + 1]
+        if np.isnan(d0) or np.isnan(d1):
+            continue
+        if d0 * d1 < 0:
+            t        = d0 / (d0 - d1)
+            y_int    = y1[i] + t * (y1[i + 1] - y1[i])
+            t0       = dates.iloc[i].timestamp()
+            t1       = dates.iloc[i + 1].timestamp()
+            date_int = pd.Timestamp(t0 + t * (t1 - t0), unit="s")
+            intersects.append((date_int, y_int))
+        elif d0 == 0:
+            intersects.append((dates.iloc[i], y1[i]))
+    return intersects
+
+
+def main():
+    # ================
+    # 1) LOAD & CLEAN
+    # ================
+    df = pd.read_csv("PriceData_2000-2024.csv")
+    df.columns      = df.columns.str.strip()
+    df["TradeDate"] = pd.to_datetime(df["TradeDate"], errors="coerce")
+    df["Price"]     = pd.to_numeric(df["Price"],      errors="coerce")
+    df = df.dropna(subset=["TradeDate", "Price"])
+    df = df.sort_values("TradeDate").reset_index(drop=True)
+
+    dupes = df[df["TradeDate"].duplicated()]
+    if not dupes.empty:
+        print(f"[WARNING] {len(dupes)} duplicate date(s) - keeping last")
+        df = df.drop_duplicates(subset="TradeDate", keep="last")
+
+    n_zero = (df["Price"] <= 0).sum()
+    print(f"[INFO] Removed {n_zero} rows with Price <= 0")
+    df = df[df["Price"] > 0].reset_index(drop=True)
+
+    # ===================
+    # 2) DERIVE FEATURES
+    # ===================
+    df["LogReturn"] = np.log(df["Price"] / df["Price"].shift(1))
+    df["MA20"]      = df["Price"].rolling(20, min_periods=20).mean()
+    df["MA60"]      = df["Price"].rolling(60, min_periods=60).mean()
+
+    df = (df.dropna()
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+            .reset_index(drop=True))
+
+    # Pass 1 - remove extreme log returns
+    df = remove_spikes(df)
+
+    # Pass 2 - rolling median filter on Price
+    # Any price deviating more than 3x the rolling median is a bad tick
+    rolling_med = df["Price"].rolling(window=20, center=True, min_periods=1).median()
+    ratio       = df["Price"] / rolling_med
+    bad_ticks   = ((ratio > 3.0) | (ratio < 0.33)).sum()
+    print(f"[INFO] Rolling median filter removed {bad_ticks} bad price tick(s)")
+    df = df[(ratio <= 3.0) & (ratio >= 0.33)].reset_index(drop=True)
+
+    # Recompute log returns and MAs on fully clean price series
+    df["LogReturn"] = np.log(df["Price"] / df["Price"].shift(1))
+    df["MA20"]      = df["Price"].rolling(20, min_periods=20).mean()
+    df["MA60"]      = df["Price"].rolling(60, min_periods=60).mean()
+    df = df.dropna().reset_index(drop=True)
+
+
+    # =====================
+    # 3) RISK METRICS USED
+    # =====================
+    annual_return = df["LogReturn"].mean() * 252
+    annual_vol    = df["LogReturn"].std()  * np.sqrt(252)
+    sharpe        = (annual_return - RISK_FREE_RATE) / annual_vol if annual_vol else np.nan
+    var_95        = df["LogReturn"].quantile(0.05)
+    cvar_95       = df.loc[df["LogReturn"] <= var_95, "LogReturn"].mean()
+
+    df["Cumulative"] = np.exp(df["LogReturn"].cumsum())
+    df["Peak"]       = df["Cumulative"].cummax()
+    df["Drawdown"]   = df["Cumulative"] / df["Peak"] - 1
+    max_drawdown     = df["Drawdown"].min()
+
+    # =====================
+    # 4) PREVIEW & SUMMARY
+    # =====================
+    print("\n=== CLEAN DATASET PREVIEW ===")
+    print(df[["TradeDate", "Price", "LogReturn", "MA20", "MA60"]]
+          .head(15).to_string(index=False))
+
+    summary = pd.DataFrame({
+        "Metric": [
+            "Row Count", "Start Date", "End Date", "Latest Price",
+            "Annualized Return", "Annualized Volatility",
+            "VaR 95% (1-Day)", "CVaR 95%",
+            "Sharpe Ratio (rf=0)", "Max Drawdown"
+        ],
+        "Value": [
+            len(df),
+            df["TradeDate"].min().date(),
+            df["TradeDate"].max().date(),
+            round(df["Price"].iloc[-1], 4),
+            round(annual_return, 4),
+            round(annual_vol,    4),
+            round(var_95,        4),
+            round(cvar_95,       4),
+            round(sharpe,        4),
+            round(max_drawdown,  4)
+        ]
+    })
+    print("\n=== SUMMARY TABLE ===")
+    print(summary.to_string(index=False))
+
+    df.to_csv("clean_dataset.csv", index=False)
+    print("\n[INFO] Exported -> clean_dataset.csv")
+
+    # =================
+    # 5) INTERSECTIONS
+    # =================
+    dates  = df["TradeDate"].reset_index(drop=True)
+    prices = df["Price"].to_numpy(dtype=float)
+    ma20   = df["MA20"].to_numpy(dtype=float)
+    ma60   = df["MA60"].to_numpy(dtype=float)
+
+    ix_p20  = find_intersections(dates, prices, ma20)
+    ix_p60  = find_intersections(dates, prices, ma60)
+    ix_2060 = find_intersections(dates, ma20,   ma60)
+
+    print(f"[INFO] Price cross MA20 : {len(ix_p20)} crossings")
+    print(f"[INFO] Price cross MA60 : {len(ix_p60)} crossings")
+    print(f"[INFO] MA20  cross MA60 : {len(ix_2060)} crossings")
+
+    # ==============
+    # 6) PLOT
+    # ==============
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(13, 9), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]}
+    )
+
+    # Panel 1 - lines
+    ax1.plot(df["TradeDate"], df["Price"],
+             color="#00B4D8", linewidth=1.5, label="Price",  zorder=2)
+    ax1.plot(df["TradeDate"], df["MA20"],
+             color="#F72585", linewidth=1.8, label="20D MA", zorder=2)
+    ax1.plot(df["TradeDate"], df["MA60"],
+             color="#90E0EF", linewidth=1.8, label="60D MA", zorder=2)
+
+    # Intersection dots
+    for d, p in ix_p20:
+        ax1.plot(d, p, "o", color="#FFD60A", markersize=4, zorder=5)
+    for d, p in ix_p60:
+        ax1.plot(d, p, "o", color="#FF9E00", markersize=4, zorder=5)
+    for d, p in ix_2060:
+        ax1.plot(d, p, "o", color="#FFFFFF", markersize=4, zorder=5)
+
+    # Legend
+    p1 = mpatches.Patch(color="#00B4D8", label="Price")
+    p2 = mpatches.Patch(color="#F72585", label="20D MA")
+    p3 = mpatches.Patch(color="#90E0EF", label="60D MA")
+    p4 = mpatches.Patch(color="#FFD60A", label="Price cross MA20")
+    p5 = mpatches.Patch(color="#FF9E00", label="Price cross MA60")
+    p6 = mpatches.Patch(color="#FFFFFF", label="MA20 cross MA60")
+
+    ax1.legend(handles=[p1, p2, p3, p4, p5, p6],
+               loc="upper left", fontsize=9)
+    ax1.set_title("Price Series with Moving Averages and Crossings",
+                  fontsize=14, fontweight="bold")
+    ax1.set_ylabel("Price")
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2 - drawdown
+    ax2.fill_between(df["TradeDate"], df["Drawdown"], 0,
+                     color="#FF6B6B", alpha=0.85, label="Drawdown")
+    ax2.axhline(max_drawdown, color="#C1121F", linewidth=2.5,
+                linestyle="--", label=f"Max DD: {max_drawdown:.2%}")
+    ax2.set_title("Drawdown from Peak", fontsize=12, fontweight="bold")
+    ax2.set_ylabel("Drawdown")
+    ax2.set_xlabel("Date")
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    ax2.legend(loc="lower left")
+    ax2.grid(True, alpha=0.3)
+
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
